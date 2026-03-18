@@ -6,7 +6,7 @@ Unique files are copied to a destination folder, renamed to their hash.
 ## Quick start
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/ajaytheetharappan/gdrive-dedupe.git
 cd gdrive-dedupe
 chmod +x setup.sh && ./setup.sh
 ```
