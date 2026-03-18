@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+
+# OAuth token — contains your access credentials, never commit this
+token.json
+
+# Google API credentials — never commit this
+credentials.json
