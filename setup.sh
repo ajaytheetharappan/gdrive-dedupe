@@ -13,7 +13,7 @@ echo "  ────────────────────────
 echo ""
 
 # ── 1. Python version check ───────────────────────────────────────────────────
-PYTHON=$(command -v python3 || true)
+PYTHON=$(command -v python3.12 || command -v python3.11 || command -v python3.10 || command -v python3 || true)
 [[ -z "$PYTHON" ]] && error "python3 not found. Install Python 3.10+ and re-run."
 
 PY_VERSION=$("$PYTHON" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
