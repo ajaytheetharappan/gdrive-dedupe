@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
 Downloads a zip from a Drive folder, extracts it locally, then compares
-the extracted files against an existing Drive folder by content hash.
-New files (not already present by hash) are uploaded to an output folder.
+the extracted files against an output Drive folder by content hash.
+New files (not already present by hash) are uploaded to the output folder.
+
+A hashes.json cache file is stored in the output folder to speed up
+subsequent runs (avoids re-downloading all files to recompute hashes).
 
 Usage:
-  python3 dedupe_gdrive.py <zip_folder_id> <existing_folder_id> <output_folder_id>
+  python3 dedupe_gdrive.py <zip_folder_id> <output_folder_id>
 """
 
 import hashlib
 import io
+import json
 import sys
 import tempfile
+import time
 import zipfile
 import mimetypes
 from pathlib import Path
@@ -25,6 +30,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 CREDS_FILE = Path(__file__).parent / "credentials.json"
 TOKEN_FILE = Path(__file__).parent / "token.json"
+HASH_CACHE_NAME = "hashes.json"
 
 
 def get_service():
@@ -62,23 +68,49 @@ def list_files(service, folder_id: str) -> list[dict]:
 
 
 def download_file(service, file_id: str) -> bytes:
-    request = service.files().get_media(fileId=file_id)
-    buf = io.BytesIO()
-    downloader = MediaIoBaseDownload(buf, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    return buf.getvalue()
+    def _download():
+        request = service.files().get_media(fileId=file_id)
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        return buf.getvalue()
+    return with_retry(_download)
 
 
-def upload_file(service, name: str, data: bytes, mime_type: str, parent_id: str) -> None:
-    metadata = {"name": name, "parents": [parent_id]}
-    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime_type)
-    service.files().create(body=metadata, media_body=media, fields="id").execute()
+def with_retry(fn, retries: int = 5, backoff: float = 2.0):
+    """Call fn(), retrying on network/timeout errors with exponential backoff."""
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt == retries - 1:
+                raise
+            wait = backoff ** attempt
+            print(f"  [retry {attempt + 1}/{retries - 1}] {e} — retrying in {wait:.0f}s...")
+            time.sleep(wait)
+
+
+def upload_file(service, name: str, data: bytes, mime_type: str, parent_id: str) -> str:
+    """Upload a file and return its Drive file ID."""
+    def _upload():
+        metadata = {"name": name, "parents": [parent_id]}
+        media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime_type)
+        f = service.files().create(body=metadata, media_body=media, fields="id").execute()
+        return f["id"]
+    return with_retry(_upload)
+
+
+def update_file(service, file_id: str, data: bytes, mime_type: str) -> None:
+    """Update an existing Drive file's content in place."""
+    def _update():
+        media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime_type)
+        service.files().update(fileId=file_id, media_body=media).execute()
+    with_retry(_update)
 
 
 def get_zip_from_folder(service, folder_id: str) -> tuple[str, bytes]:
-    """Find and download the first zip file in a Drive folder."""
     files = list_files(service, folder_id)
     zips = [f for f in files if f["name"].endswith(".zip")]
     if not zips:
@@ -93,29 +125,55 @@ def get_zip_from_folder(service, folder_id: str) -> tuple[str, bytes]:
 
 
 def extract_zip(zip_data: bytes, extract_dir: Path) -> list[Path]:
-    """Extract zip to a local directory, return list of extracted file paths."""
     with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
         zf.extractall(extract_dir)
-    # Return all files recursively, skip hidden/system files
     return [p for p in extract_dir.rglob("*") if p.is_file() and not p.name.startswith(".")]
 
 
-def build_hash_set(service, folder_id: str) -> set[str]:
-    """Download all files in a Drive folder and return their SHA-256 hashes."""
-    print(f"Building hash index of existing folder...")
+def load_hash_cache(service, folder_id: str) -> tuple[set[str], str | None]:
+    """
+    Load hashes.json from the output folder if it exists.
+    Returns (set_of_hashes, file_id_of_cache_or_None).
+    """
     files = list_files(service, folder_id)
-    files = [f for f in files if not f["mimeType"].startswith("application/vnd.google-apps")]
+    cache_files = [f for f in files if f["name"] == HASH_CACHE_NAME]
+    if cache_files:
+        file_id = cache_files[0]["id"]
+        print(f"Found hash cache ({HASH_CACHE_NAME}), loading...", end=" ", flush=True)
+        data = download_file(service, file_id)
+        hashes = set(json.loads(data.decode()))
+        print(f"{len(hashes)} hashes loaded.")
+        return hashes, file_id
+    return set(), None
+
+
+def save_hash_cache(service, hashes: set[str], folder_id: str, cache_file_id: str | None) -> None:
+    """Save hashes.json to the output folder, updating in place if it already exists."""
+    data = json.dumps(sorted(hashes), indent=2).encode()
+    if cache_file_id:
+        update_file(service, cache_file_id, data, "application/json")
+    else:
+        upload_file(service, HASH_CACHE_NAME, data, "application/json", folder_id)
+    print(f"Hash cache saved ({len(hashes)} hashes).")
+
+
+def build_hash_set_from_folder(service, folder_id: str) -> set[str]:
+    """Fallback: hash all files in the output folder (used when no cache exists)."""
+    files = list_files(service, folder_id)
+    files = [f for f in files if not f["mimeType"].startswith("application/vnd.google-apps")
+             and f["name"] != HASH_CACHE_NAME]
+    print(f"No cache found. Hashing {len(files)} existing files...")
     hashes = set()
     for f in files:
         print(f"  Hashing  {f['name']}...", end=" ", flush=True)
         data = download_file(service, f["id"])
         hashes.add(sha256_bytes(data))
         print("done.")
-    print(f"Existing files indexed: {len(hashes)}\n")
+    print(f"Files indexed: {len(hashes)}\n")
     return hashes
 
 
-def run(zip_folder_id: str, existing_folder_id: str, output_folder_id: str) -> None:
+def run(zip_folder_id: str, output_folder_id: str) -> None:
     service = get_service()
 
     # Step 1: Download and extract the zip
@@ -126,8 +184,10 @@ def run(zip_folder_id: str, existing_folder_id: str, output_folder_id: str) -> N
         new_files = extract_zip(zip_data, extract_dir)
         print(f"done. {len(new_files)} files extracted.\n")
 
-        # Step 2: Build hash index of existing Drive folder
-        existing_hashes = build_hash_set(service, existing_folder_id)
+        # Step 2: Load hash cache or build from scratch
+        existing_hashes, cache_file_id = load_hash_cache(service, output_folder_id)
+        if not existing_hashes:
+            existing_hashes = build_hash_set_from_folder(service, output_folder_id)
 
         # Step 3: Compare and upload new files
         print("Comparing new files against existing...")
@@ -147,18 +207,21 @@ def run(zip_folder_id: str, existing_folder_id: str, output_folder_id: str) -> N
                 print("done.")
                 uploaded += 1
 
+        # Step 4: Save updated hash cache
+        print()
+        save_hash_cache(service, existing_hashes, output_folder_id, cache_file_id)
+
         print(f"\nTotal new files : {len(new_files)}")
         print(f"Uploaded        : {uploaded}")
         print(f"Skipped (dupes) : {skipped}")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 4:
-        print("Usage: python3 dedupe_gdrive.py <zip_folder_id> <existing_folder_id> <output_folder_id>")
+    if len(sys.argv) != 3:
+        print("Usage: python3 dedupe_gdrive.py <zip_folder_id> <output_folder_id>")
         print()
-        print("  zip_folder_id      — Drive folder containing the zip of new files")
-        print("  existing_folder_id — Drive folder with existing files to compare against")
-        print("  output_folder_id   — Drive folder where new unique files will be uploaded")
+        print("  zip_folder_id    — Drive folder containing the zip of new files")
+        print("  output_folder_id — Drive folder to compare against and upload new unique files into")
         sys.exit(1)
 
-    run(sys.argv[1], sys.argv[2], sys.argv[3])
+    run(sys.argv[1], sys.argv[2])
