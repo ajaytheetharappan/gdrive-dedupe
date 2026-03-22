@@ -110,18 +110,16 @@ def update_file(service, file_id: str, data: bytes, mime_type: str) -> None:
     with_retry(_update)
 
 
-def get_zip_from_folder(service, folder_id: str) -> tuple[str, bytes]:
+def get_zips_from_folder(service, folder_id: str) -> list[dict]:
     files = list_files(service, folder_id)
-    zips = [f for f in files if f["name"].endswith(".zip")]
+    zips = [f for f in files if f["name"].endswith(".zip") or f["mimeType"] == "application/zip"]
     if not zips:
-        print("No zip file found in the zip folder.")
+        print("No zip files found in the input folder.")
         sys.exit(1)
-    zip_file = zips[0]
-    print(f"Found zip: {zip_file['name']}")
-    print("Downloading zip...", end=" ", flush=True)
-    data = download_file(service, zip_file["id"])
-    print("done.")
-    return zip_file["name"], data
+    print(f"Found {len(zips)} zip(s):")
+    for z in zips:
+        print(f"  - {z['name']}")
+    return zips
 
 
 def extract_zip(zip_data: bytes, extract_dir: Path) -> list[Path]:
@@ -147,14 +145,16 @@ def load_hash_cache(service, folder_id: str) -> tuple[set[str], str | None]:
     return set(), None
 
 
-def save_hash_cache(service, hashes: set[str], folder_id: str, cache_file_id: str | None) -> None:
-    """Save hashes.json to the output folder, updating in place if it already exists."""
+def save_hash_cache(service, hashes: set[str], folder_id: str, cache_file_id: str | None) -> str:
+    """Save hashes.json to the output folder, updating in place if it already exists.
+    Returns the file ID of the cache file."""
     data = json.dumps(sorted(hashes), indent=2).encode()
     if cache_file_id:
         update_file(service, cache_file_id, data, "application/json")
+        return cache_file_id
     else:
-        upload_file(service, HASH_CACHE_NAME, data, "application/json", folder_id)
-    print(f"Hash cache saved ({len(hashes)} hashes).")
+        file_id = upload_file(service, HASH_CACHE_NAME, data, "application/json", folder_id)
+        return file_id
 
 
 def build_hash_set_from_folder(service, folder_id: str) -> set[str]:
@@ -176,44 +176,55 @@ def build_hash_set_from_folder(service, folder_id: str) -> set[str]:
 def run(zip_folder_id: str, output_folder_id: str) -> None:
     service = get_service()
 
-    # Step 1: Download and extract the zip
-    _, zip_data = get_zip_from_folder(service, zip_folder_id)
-    with tempfile.TemporaryDirectory() as tmpdir:
-        extract_dir = Path(tmpdir)
-        print("Extracting zip...", end=" ", flush=True)
-        new_files = extract_zip(zip_data, extract_dir)
-        print(f"done. {len(new_files)} files extracted.\n")
+    # Step 1: Find all zips in the input folder
+    zips = get_zips_from_folder(service, zip_folder_id)
+    print()
 
-        # Step 2: Load hash cache or build from scratch
-        existing_hashes, cache_file_id = load_hash_cache(service, output_folder_id)
-        if not existing_hashes:
-            existing_hashes = build_hash_set_from_folder(service, output_folder_id)
+    # Step 2: Load hash cache once (or build from scratch)
+    existing_hashes, cache_file_id = load_hash_cache(service, output_folder_id)
+    if not existing_hashes:
+        existing_hashes = build_hash_set_from_folder(service, output_folder_id)
 
-        # Step 3: Compare and upload new files
-        print("Comparing new files against existing...")
-        uploaded = 0
-        skipped = 0
-        for path in sorted(new_files):
-            data = path.read_bytes()
-            digest = sha256_bytes(data)
-            if digest in existing_hashes:
-                print(f"  SKIP      {path.name}  (already exists)")
-                skipped += 1
-            else:
-                mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-                print(f"  UPLOAD    {path.name}...", end=" ", flush=True)
-                upload_file(service, path.name, data, mime_type, output_folder_id)
-                existing_hashes.add(digest)
-                print("done.")
-                uploaded += 1
+    total_uploaded = 0
+    total_skipped = 0
 
-        # Step 4: Save updated hash cache
-        print()
-        save_hash_cache(service, existing_hashes, output_folder_id, cache_file_id)
+    # Step 3: Process each zip one by one
+    for i, zip_entry in enumerate(zips, 1):
+        print(f"── Zip {i}/{len(zips)}: {zip_entry['name']} ──")
+        print("Downloading...", end=" ", flush=True)
+        zip_data = download_file(service, zip_entry["id"])
+        print("done.")
 
-        print(f"\nTotal new files : {len(new_files)}")
-        print(f"Uploaded        : {uploaded}")
-        print(f"Skipped (dupes) : {skipped}")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            extract_dir = Path(tmpdir)
+            print("Extracting...", end=" ", flush=True)
+            new_files = extract_zip(zip_data, extract_dir)
+            print(f"done. {len(new_files)} files extracted.")
+
+            uploaded = 0
+            skipped = 0
+            for path in sorted(new_files):
+                data = path.read_bytes()
+                digest = sha256_bytes(data)
+                if digest in existing_hashes:
+                    print(f"  SKIP      {path.name}  (already exists)")
+                    skipped += 1
+                else:
+                    mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+                    print(f"  UPLOAD    {path.name}...", end=" ", flush=True)
+                    upload_file(service, path.name, data, mime_type, output_folder_id)
+                    existing_hashes.add(digest)
+                    cache_file_id = save_hash_cache(service, existing_hashes, output_folder_id, cache_file_id)
+                    print("done.")
+                    uploaded += 1
+
+        print(f"  → Uploaded: {uploaded}  Skipped: {skipped}\n")
+        total_uploaded += uploaded
+        total_skipped += skipped
+
+    print(f"── All done ──")
+    print(f"Total uploaded : {total_uploaded}")
+    print(f"Total skipped  : {total_skipped}")
 
 
 if __name__ == "__main__":
